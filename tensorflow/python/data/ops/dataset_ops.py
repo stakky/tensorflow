@@ -3348,7 +3348,7 @@ class RangeDataset(DatasetSource):
   def __init__(self, *args):
     """See `Dataset.range()` for details."""
     self._parse_args(*args)
-    self._structure = tensor_spec.TensorSpec([], dtypes.int64)
+    self._structure = tensor_spec.TensorSpec([], dtypes.int32)
     variant_tensor = gen_dataset_ops.range_dataset(
         start=self._start,
         stop=self._stop,
@@ -3373,8 +3373,8 @@ class RangeDataset(DatasetSource):
     else:
       raise ValueError("Invalid arguments to RangeDataset: %s" % str(args))
 
-  def _build_tensor(self, int64_value, name):
-    return ops.convert_to_tensor(int64_value, dtype=dtypes.int64, name=name)
+  def _build_tensor(self, int32_value, name):
+    return ops.convert_to_tensor(int32_value, dtype=dtypes.int32, name=name)
 
   @property
   def element_spec(self):

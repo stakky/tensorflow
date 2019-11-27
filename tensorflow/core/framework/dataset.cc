@@ -423,6 +423,14 @@ Status DatasetBaseIterator::GetNext(IteratorContext* ctx,
 void DatasetOpKernel::Compute(OpKernelContext* ctx) {
   DatasetBase* dataset = nullptr;
   MakeDataset(ctx, &dataset);
+  for (int i = 0; i < ctx->num_inputs(); i++) {
+    LOG(INFO) << "ctx->input_dtype(" << i << "): "
+	      << DataTypeString(ctx->input_dtype(i));
+  }
+  for (int i = 0; i < ctx->num_outputs(); i++) {
+    LOG(INFO) << "ctx->expected_output_dtype(" << i << "): "
+	      << DataTypeString(ctx->expected_output_dtype(i));
+  }
   if (ctx->status().ok()) {
     Tensor* output = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &output));

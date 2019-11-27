@@ -30,6 +30,8 @@ limitations under the License.
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/util.h"
 
+#include "tensorflow/core/framework/op_kernel.h"
+
 namespace tensorflow {
 
 namespace {
@@ -158,6 +160,7 @@ thread::ThreadPool* NewThreadPoolFromSessionOptions(
     const SessionOptions& options) {
   const int32 num_threads = NumInterOpThreadsFromSessionOptions(options);
   VLOG(1) << "Direct session inter op parallelism threads: " << num_threads;
+  LogAllRegisteredKernels();
   return new thread::ThreadPool(
       options.env, ThreadOptions(), "Compute", num_threads,
       !options.config.experimental().disable_thread_spinning(),
