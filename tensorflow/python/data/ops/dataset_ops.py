@@ -75,6 +75,13 @@ from tensorflow.python.util import lazy_loader
 from tensorflow.python.util import nest as tf_nest
 from tensorflow.python.util.tf_export import tf_export
 
+import inspect
+import os
+
+def location(depth=0):
+  frame = inspect.currentframe().f_back
+  return os.path.basename(frame.f_code.co_filename), frame.f_code.co_name, frame.f_lineno
+
 # Loaded lazily due to a circular dependency (roughly
 # tf.function->wrap_function->dataset->autograph->tf.function).
 # TODO(b/133251390): Use a regular import.
@@ -3347,7 +3354,7 @@ class RangeDataset(DatasetSource):
 
   def __init__(self, *args, **kwargs):
     """See `Dataset.range()` for details."""
-    self._parse_args(*args)
+    self._parse_args(*args, **kwargs)
     self._structure = tensor_spec.TensorSpec([], self._dtype)
     variant_tensor = gen_dataset_ops.range_dataset(
         start=self._start,
@@ -3358,8 +3365,12 @@ class RangeDataset(DatasetSource):
 
   def _parse_args(self, *args, **kwargs):
     """Parse arguments according to the same rules as the `range()` builtin."""
+    print(location())
+    print(kwargs)
     self._dtype = kwargs.get('dtype', None)
     if self._dtype is None:
+      print(location())
+      print(self._dtype)
       self._dtype = dtypes.int64
     if len(args) == 1:
       self._start = self._build_tensor(0, "start")
