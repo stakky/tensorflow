@@ -411,6 +411,16 @@ struct ResizeBilinearGrad<CPUDevice, T> {
     //                     + top_right    * (1 - y) *      x
     //                     + bottom_left  *      y  * (1 - x)
     //                     + bottom_right *      y  *      x
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+    // xdote: Equivalents to: num_threads = min(batch, omp_get_max_threads());
+    int num_threads = 1;
+    int max_threads = omp_get_max_threads();
+    if (batch > max_threads)
+      num_threads = max_threads;
+    else
+      num_threads = batch;
+    #pragma omp parallel for num_threads(num_threads)
+#endif
     for (Eigen::Index b = 0; b < batch; ++b) {
       for (Eigen::Index y = 0; y < resized_height; ++y) {
         const float in_y = scaler(y, height_scale);
