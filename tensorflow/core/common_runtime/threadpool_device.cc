@@ -90,6 +90,11 @@ ThreadPoolDevice::ThreadPoolDevice(const SessionOptions& options,
 #ifndef DNNL_AARCH64_USE_ACL
   const char* user_kmp_blocktime = getenv("KMP_BLOCKTIME");
   static absl::once_flag blocktime_setting_flag;
+#if	defined(FJ_TWEAKS_FOR_AARCH64) && defined(__FCC_version__)
+  // Workaround for fcc runtime bug.
+  // Assign tid asap by calling OpenMP function here.
+  static const int _blocktime = kmp_get_blocktime();
+#endif
   if (user_kmp_blocktime == nullptr) {
     // Sets the time, in milliseconds, that a thread should wait,
     // after completing the execution of a parallel region, before sleeping.
