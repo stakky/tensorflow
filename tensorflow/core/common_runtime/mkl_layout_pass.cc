@@ -685,11 +685,18 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
                       mkl_op_registry::GetMklOpName(csinfo_.requantize),
                       CopyAttrsAll, AlwaysRewrite, GetRewriteCause()});
     // Optimized TanhGrad support exists only in DNNL 1.x.
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+    static const char* tf_use_mkltanh = std::getenv("TF_USE_MKLTANH");
+    if (tf_use_mkltanh) {
+#endif
     rinfo_.push_back({csinfo_.tanh, mkl_op_registry::GetMklOpName(csinfo_.tanh),
-                      CopyAttrsAll, AlwaysRewrite, GetRewriteCause()});
+		      CopyAttrsAll, AlwaysRewrite, GetRewriteCause()});
     rinfo_.push_back({csinfo_.tanh_grad,
-                      mkl_op_registry::GetMklOpName(csinfo_.tanh_grad),
-                      CopyAttrsAll, AlwaysRewrite, GetRewriteCause()});
+		      mkl_op_registry::GetMklOpName(csinfo_.tanh_grad),
+		      CopyAttrsAll, AlwaysRewrite, GetRewriteCause()});
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+    }
+#endif
     rinfo_.push_back({csinfo_.reshape,
                       mkl_op_registry::GetMklOpName(csinfo_.reshape),
                       CopyAttrsAll, AlwaysRewrite, GetRewriteCause()});
