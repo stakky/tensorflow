@@ -1,0 +1,529 @@
+commit 36daf074d997a79f25a1de2a1b869170ea6c20cc
+Author: Florian Mayer <fmayer@google.com>
+Date:   Wed Sep 15 10:10:11 2021 +0100
+
+    [hwasan] also omit safe mem[cpy|mov|set].
+    
+    Reviewed By: eugenis
+    
+    Differential Revision: https://reviews.llvm.org/D109816
+
+diff --git a/llvm/include/llvm/Analysis/StackSafetyAnalysis.h b/llvm/include/llvm/Analysis/StackSafetyAnalysis.h
+index a028107e213c..751735f3e59f 100644
+--- a/llvm/include/llvm/Analysis/StackSafetyAnalysis.h
++++ b/llvm/include/llvm/Analysis/StackSafetyAnalysis.h
+@@ -78,9 +78,12 @@ public:
+   // Whether we can prove that all accesses to this Alloca are in-range and
+   // during its lifetime.
+   bool isSafe(const AllocaInst &AI) const;
+-  // Whether we can prove that an instruction only accesses a live alloca in
+-  // range.
+-  bool accessIsSafe(const Instruction &I) const;
++
++  // Returns true if the instruction can be proven to do only two types of
++  // memory accesses:
++  //  (1) live stack locations in-bounds or
++  //  (2) non-stack locations.
++  bool stackAccessIsSafe(const Instruction &I) const;
+   void print(raw_ostream &O) const;
+   void dump() const;
+ };
+diff --git a/llvm/lib/Analysis/StackSafetyAnalysis.cpp b/llvm/lib/Analysis/StackSafetyAnalysis.cpp
+index 0e981d123b7b..44f8a18bd4d9 100644
+--- a/llvm/lib/Analysis/StackSafetyAnalysis.cpp
++++ b/llvm/lib/Analysis/StackSafetyAnalysis.cpp
+@@ -230,7 +230,7 @@ struct StackSafetyInfo::InfoTy {
+ struct StackSafetyGlobalInfo::InfoTy {
+   GVToSSI Info;
+   SmallPtrSet<const AllocaInst *, 8> SafeAllocas;
+-  SmallPtrSet<const Instruction *, 8> SafeAccesses;
++  std::map<const Instruction *, bool> AccessIsUnsafe;
+ };
+ 
+ namespace {
+@@ -820,7 +820,6 @@ const StackSafetyGlobalInfo::InfoTy &StackSafetyGlobalInfo::getInfo() const {
+     Info.reset(new InfoTy{
+         createGlobalStackSafetyInfo(std::move(Functions), Index), {}, {}});
+ 
+-    std::map<const Instruction *, bool> AccessIsUnsafe;
+     for (auto &FnKV : Info->Info) {
+       for (auto &KV : FnKV.second.Allocas) {
+         ++NumAllocaTotal;
+@@ -831,14 +830,10 @@ const StackSafetyGlobalInfo::InfoTy &StackSafetyGlobalInfo::getInfo() const {
+           ++NumAllocaStackSafe;
+         }
+         for (const auto &A : KV.second.Accesses)
+-          AccessIsUnsafe[A.first] |= !AIRange.contains(A.second);
++          Info->AccessIsUnsafe[A.first] |= !AIRange.contains(A.second);
+       }
+     }
+ 
+-    for (const auto &KV : AccessIsUnsafe)
+-      if (!KV.second)
+-        Info->SafeAccesses.insert(KV.first);
+-
+     if (StackSafetyPrint)
+       print(errs());
+   }
+@@ -908,9 +903,13 @@ bool StackSafetyGlobalInfo::isSafe(const AllocaInst &AI) const {
+   return Info.SafeAllocas.count(&AI);
+ }
+ 
+-bool StackSafetyGlobalInfo::accessIsSafe(const Instruction &I) const {
++bool StackSafetyGlobalInfo::stackAccessIsSafe(const Instruction &I) const {
+   const auto &Info = getInfo();
+-  return Info.SafeAccesses.count(&I);
++  auto It = Info.AccessIsUnsafe.find(&I);
++  if (It == Info.AccessIsUnsafe.end()) {
++    return true;
++  }
++  return !It->second;
+ }
+ 
+ void StackSafetyGlobalInfo::print(raw_ostream &O) const {
+@@ -924,7 +923,10 @@ void StackSafetyGlobalInfo::print(raw_ostream &O) const {
+       O << "    safe accesses:"
+         << "\n";
+       for (const auto &I : instructions(F)) {
+-        if (accessIsSafe(I)) {
++        const CallInst *Call = dyn_cast<CallInst>(&I);
++        if ((isa<StoreInst>(I) || isa<LoadInst>(I) || isa<MemIntrinsic>(I) ||
++             (Call && Call->hasByValArgument())) &&
++            stackAccessIsSafe(I)) {
+           O << "     " << I << "\n";
+         }
+       }
+diff --git a/llvm/lib/Transforms/Instrumentation/HWAddressSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/HWAddressSanitizer.cpp
+index 433a85257243..a2150725dfe1 100644
+--- a/llvm/lib/Transforms/Instrumentation/HWAddressSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/HWAddressSanitizer.cpp
+@@ -290,6 +290,7 @@ public:
+   void instrumentMemAccessInline(Value *Ptr, bool IsWrite,
+                                  unsigned AccessSizeIndex,
+                                  Instruction *InsertBefore);
++  bool ignoreMemIntrinsic(MemIntrinsic *MI);
+   void instrumentMemIntrinsic(MemIntrinsic *MI);
+   bool instrumentMemAccess(InterestingMemoryOperand &O);
+   bool ignoreAccess(Instruction *Inst, Value *Ptr);
+@@ -798,11 +799,11 @@ bool HWAddressSanitizer::ignoreAccess(Instruction *Inst, Value *Ptr) {
+   if (Ptr->isSwiftError())
+     return true;
+ 
+-  if (!InstrumentStack) {
+-    if (findAllocaForValue(Ptr))
++  if (findAllocaForValue(Ptr)) {
++    if (!InstrumentStack)
++      return true;
++    if (SSI && SSI->stackAccessIsSafe(*Inst))
+       return true;
+-  } else if (SSI && SSI->accessIsSafe(*Inst)) {
+-    return true;
+   }
+   return false;
+ }
+@@ -994,6 +995,16 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
+     cast<BranchInst>(CheckFailTerm)->setSuccessor(0, CheckTerm->getParent());
+ }
+ 
++bool HWAddressSanitizer::ignoreMemIntrinsic(MemIntrinsic *MI) {
++  if (MemTransferInst *MTI = dyn_cast<MemTransferInst>(MI)) {
++    return (!ClInstrumentWrites || ignoreAccess(MTI, MTI->getDest())) &&
++           (!ClInstrumentReads || ignoreAccess(MTI, MTI->getSource()));
++  }
++  if (isa<MemSetInst>(MI))
++    return !ClInstrumentWrites || ignoreAccess(MI, MI->getDest());
++  return false;
++}
++
+ void HWAddressSanitizer::instrumentMemIntrinsic(MemIntrinsic *MI) {
+   IRBuilder<> IRB(MI);
+   if (isa<MemTransferInst>(MI)) {
+@@ -1542,7 +1553,8 @@ bool HWAddressSanitizer::sanitizeFunction(
+       getInterestingMemoryOperands(&Inst, OperandsToInstrument);
+ 
+       if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
+-        IntrinToInstrument.push_back(MI);
++        if (!ignoreMemIntrinsic(MI))
++          IntrinToInstrument.push_back(MI);
+     }
+   }
+ 
+diff --git a/llvm/test/Analysis/StackSafetyAnalysis/ipa-alias.ll b/llvm/test/Analysis/StackSafetyAnalysis/ipa-alias.ll
+index 2bce5b9716e2..3169ed62d39c 100644
+--- a/llvm/test/Analysis/StackSafetyAnalysis/ipa-alias.ll
++++ b/llvm/test/Analysis/StackSafetyAnalysis/ipa-alias.ll
+@@ -136,4 +136,5 @@ entry:
+ ; CHECK-NEXT: p[]: [0,1){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 0, i8* %p, align 1
+ ; CHECK-EMPTY:
+diff --git a/llvm/test/Analysis/StackSafetyAnalysis/ipa.ll b/llvm/test/Analysis/StackSafetyAnalysis/ipa.ll
+index 69ec4dac88c9..ce1761ab3017 100644
+--- a/llvm/test/Analysis/StackSafetyAnalysis/ipa.ll
++++ b/llvm/test/Analysis/StackSafetyAnalysis/ipa.ll
+@@ -272,6 +272,7 @@ define private void @PrivateWrite1(i8* %p) #0 {
+ ; CHECK-NEXT: p[]: [0,1){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 0, i8* %p, align 1
+ ; CHECK-EMPTY:
+ entry:
+   store i8 0, i8* %p, align 1
+@@ -563,6 +564,7 @@ entry:
+ ; CHECK-NEXT: p[]: [0,1){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 0, i8* %p, align 1
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @Write4{{$}}
+@@ -570,6 +572,7 @@ entry:
+ ; CHECK-NEXT: p[]: [0,4){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i32 0, i32* %0, align 1
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @Write4_2{{$}}
+@@ -578,6 +581,8 @@ entry:
+ ; CHECK-NEXT: q[]: [0,4){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i32 0, i32* %0, align 1
++; GLOBAL-NEXT: store i32 0, i32* %1, align 1
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @Write8{{$}}
+@@ -585,6 +590,7 @@ entry:
+ ; CHECK-NEXT: p[]: [0,8){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i64 0, i64* %0, align 1
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @WriteAndReturn8{{$}}
+@@ -592,6 +598,7 @@ entry:
+ ; CHECK-NEXT: p[]: full-set{{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 0, i8* %p, align 1
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @PreemptableWrite1 dso_preemptable{{$}}
+@@ -599,6 +606,7 @@ entry:
+ ; CHECK-NEXT: p[]: [0,1){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 0, i8* %p, align 1
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @InterposableWrite1 interposable{{$}}
+@@ -606,6 +614,7 @@ entry:
+ ; CHECK-NEXT: p[]: [0,1){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 0, i8* %p, align 1
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @ReturnDependent{{$}}
+@@ -646,6 +655,9 @@ entry:
+ ; CHECK-NEXT: acc[]: [0,4), @RecursiveNoOffset(arg2, [0,1)){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: %0 = load i32, i32* %p, align 4
++; GLOBAL-NEXT: %1 = load i32, i32* %acc, align 4
++; GLOBAL-NEXT: store i32 %add, i32* %acc, align 4
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @RecursiveWithOffset{{$}}
+@@ -654,6 +666,7 @@ entry:
+ ; GLOBAL-NEXT: acc[]: full-set, @RecursiveWithOffset(arg1, [4,5)){{$}}
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i32 0, i32* %acc, align 4
+ ; CHECK-EMPTY:
+ 
+ ; CHECK-LABEL: @ReturnAlloca
+diff --git a/llvm/test/Analysis/StackSafetyAnalysis/local.ll b/llvm/test/Analysis/StackSafetyAnalysis/local.ll
+index 7a63a8c44efd..f764fe3e8409 100644
+--- a/llvm/test/Analysis/StackSafetyAnalysis/local.ll
++++ b/llvm/test/Analysis/StackSafetyAnalysis/local.ll
+@@ -114,6 +114,8 @@ define dso_local void @WriteMinMax(i8* %p) {
+ ; CHECK-NEXT: p[]: full-set
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 0, i8* %p1, align 1
++; GLOBAL-NEXT: store i8 0, i8* %p2, align 1
+ ; CHECK-EMPTY:
+ entry:
+   %p1 = getelementptr i8, i8* %p, i64 9223372036854775805
+@@ -129,6 +131,8 @@ define dso_local void @WriteMax(i8* %p) {
+ ; CHECK-NEXT: p[]: [-9223372036854775807,9223372036854775806)
+ ; CHECK-NEXT: allocas uses:
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: call void @llvm.memset.p0i8.i64(i8* %p, i8 1, i64 9223372036854775806, i1 false)
++; GLOBAL-NEXT: call void @llvm.memset.p0i8.i64(i8* %p2, i8 1, i64 9223372036854775806, i1 false)
+ ; CHECK-EMPTY:
+ entry:
+   call void @llvm.memset.p0i8.i64(i8* %p, i8 1, i64 9223372036854775806, i1 0)
+@@ -476,6 +480,7 @@ define void @Scalable(<vscale x 4 x i32>* %p, <vscale x 4 x i32>* %unused, <vsca
+ ; CHECK-NEXT: allocas uses:
+ ; CHECK-NEXT:   x[0]: [0,1){{$}}
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store <vscale x 4 x i32> %v, <vscale x 4 x i32>* %p, align 4
+ ; CHECK-EMPTY:
+ entry:
+   %x = alloca <vscale x 4 x i32>, align 4
+@@ -495,6 +500,8 @@ define void @ZeroSize(%zerosize_type *%p)  {
+ ; CHECK-NEXT:   x[0]: empty-set
+ ; GLOBAL-NEXT: safe accesses:
+ ; GLOBAL-NEXT: store %zerosize_type undef, %zerosize_type* %x, align 4
++; GLOBAL-NEXT: store %zerosize_type undef, %zerosize_type* undef, align 4
++; GLOBAL-NEXT: load %zerosize_type, %zerosize_type* %p, align 
+ ; CHECK-EMPTY:
+ entry:
+   %x = alloca %zerosize_type, align 4
+@@ -572,6 +579,7 @@ define dso_local i8 @LoadMinInt64(i8* %p) {
+   ; CHECK-NEXT: p[]: [-9223372036854775808,-9223372036854775807){{$}}
+   ; CHECK-NEXT: allocas uses:
+   ; GLOBAL-NEXT: safe accesses:
++  ; GLOBAL-NEXT: load i8, i8* %p2, align 1
+   ; CHECK-EMPTY:
+   %p2 = getelementptr i8, i8* %p, i64 -9223372036854775808
+   %v = load i8, i8* %p2, align 1
+@@ -600,6 +608,8 @@ define void @DeadBlock(i64* %p) {
+ ; CHECK-NEXT: allocas uses:
+ ; CHECK-NEXT: x[1]: empty-set{{$}}
+ ; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: store i8 5, i8* %x
++; GLOBAL-NEXT: store i64 -5, i64* %p
+ ; CHECK-EMPTY:
+ entry:
+   %x = alloca i8, align 4
+@@ -846,6 +856,58 @@ tlabel:
+   ret i32* %a
+ }
+ 
++define void @MixedAccesses6(i8* %arg) {
++; CHECK-LABEL: @MixedAccesses6
++; CHECK-NEXT: args uses:
++; CHECK-NEXT: arg[]: [0,4)
++; CHECK-NEXT: allocas uses:
++; CHECK: a[4]: [0,4)
++; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: call void @llvm.memcpy.p0i8.p0i8.i32(i8* %x, i8* %arg, i32 4, i1 false)
++; CHECK-EMPTY:
++entry:
++  %a = alloca i32, align 4
++  %x = bitcast i32* %a to i8*
++  call void @llvm.memcpy.p0i8.p0i8.i32(i8* %x, i8* %arg, i32 4, i1 false)
++  ret void
++}
++
++define void @MixedAccesses7(i1 %cond, i8* %arg) {
++; SECV doesn't support select, so we consider this non-stack-safe, even through
++; it is.
++;
++; CHECK-LABEL: @MixedAccesses7
++; CHECK-NEXT: args uses:
++; CHECK-NEXT: arg[]: full-set
++; CHECK-NEXT: allocas uses:
++; CHECK: a[4]: full-set
++; GLOBAL-NEXT: safe accesses:
++; CHECK-EMPTY:
++entry:
++  %a = alloca i32, align 4
++  %x = bitcast i32* %a to i8*
++  %x1 = select i1 %cond, i8* %arg, i8* %x
++  call void @llvm.memcpy.p0i8.p0i8.i32(i8* %x1, i8* %arg, i32 4, i1 false)
++  ret void
++}
++
++define void @NoStackAccess(i8* %arg1, i8* %arg2) {
++; CHECK-LABEL: @NoStackAccess
++; CHECK-NEXT: args uses:
++; CHECK-NEXT: arg1[]: [0,4)
++; CHECK-NEXT: arg2[]: [0,4)
++; CHECK-NEXT: allocas uses:
++; CHECK: a[4]: empty-set{{$}}
++; GLOBAL-NEXT: safe accesses:
++; GLOBAL-NEXT: call void @llvm.memcpy.p0i8.p0i8.i32(i8* %arg1, i8* %arg2, i32 4, i1 false)
++; CHECK-EMPTY:
++entry:
++  %a = alloca i32, align 4
++  %x = bitcast i32* %a to i8*
++  call void @llvm.memcpy.p0i8.p0i8.i32(i8* %arg1, i8* %arg2, i32 4, i1 false)
++  ret void
++}
++
+ define void @DoubleLifetime() {
+ ; CHECK-LABEL: @DoubleLifetime
+ ; CHECK-NEXT: args uses:
+diff --git a/llvm/test/Instrumentation/HWAddressSanitizer/mem-intrinsics.ll b/llvm/test/Instrumentation/HWAddressSanitizer/mem-intrinsics.ll
+index ef932711ce49..a48cf751a1e1 100644
+--- a/llvm/test/Instrumentation/HWAddressSanitizer/mem-intrinsics.ll
++++ b/llvm/test/Instrumentation/HWAddressSanitizer/mem-intrinsics.ll
+@@ -1,4 +1,4 @@
+-; RUN: opt -S -passes=hwasan %s | FileCheck %s
++; RUN: opt -S -passes=hwasan -hwasan-use-stack-safety=0 %s | FileCheck %s
+ 
+ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+ target triple = "x86_64-unknown-linux-gnu"
+diff --git a/llvm/test/Instrumentation/HWAddressSanitizer/stack-safety-analysis.ll b/llvm/test/Instrumentation/HWAddressSanitizer/stack-safety-analysis.ll
+index 51d7cb56608d..46d0b89b80b1 100644
+--- a/llvm/test/Instrumentation/HWAddressSanitizer/stack-safety-analysis.ll
++++ b/llvm/test/Instrumentation/HWAddressSanitizer/stack-safety-analysis.ll
+@@ -78,6 +78,57 @@ entry:
+   ret i32 0
+ }
+ 
++define i32 @test_in_range3(i32* %a) sanitize_hwaddress {
++entry:
++  ; CHECK-LABEL: @test_in_range3
++  ; NOSAFETY: call {{.*}}__hwasan_generate_tag
++  ; NOSAFETY: call {{.*}}__hwasan_memset
++  ; SAFETY-NOT: call {{.*}}__hwasan_generate_tag
++  ; SAFETY-NOT: call {{.*}}__hwasan_memset
++  ; NOSTACK-NOT: call {{.*}}__hwasan_generate_tag
++  ; NOSTACK-NOT: call {{.*}}__hwasan_memset
++  %buf.sroa.0 = alloca [10 x i8], align 4
++  %ptr = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %x = bitcast [10 x i8]* %buf.sroa.0 to i8*
++  call void @llvm.memset.p0i8.i32(i8* %ptr, i8 0, i32 1, i1 true)
++  ret i32 0
++}
++
++define i32 @test_in_range4(i32* %a) sanitize_hwaddress {
++entry:
++  ; CHECK-LABEL: @test_in_range4
++  ; NOSAFETY: call {{.*}}__hwasan_generate_tag
++  ; NOSAFETY: call {{.*}}__hwasan_memmove
++  ; SAFETY-NOT: call {{.*}}__hwasan_generate_tag
++  ; SAFETY-NOT: call {{.*}}__hwasan_memmove
++  ; NOSTACK-NOT: call {{.*}}__hwasan_generate_tag
++  ; NOSTACK-NOT: call {{.*}}__hwasan_memmove
++  %buf.sroa.0 = alloca [10 x i8], align 4
++  %ptr = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %x = bitcast [10 x i8]* %buf.sroa.0 to i8*
++  call void @llvm.memmove.p0i8.p0i8.i32(i8* %ptr, i8* %ptr, i32 1, i1 true)
++  ret i32 0
++}
++
++define i32 @test_in_range5(i32* %a) sanitize_hwaddress {
++entry:
++  ; CHECK-LABEL: @test_in_range5
++  ; NOSAFETY: call {{.*}}__hwasan_generate_tag
++  ; NOSAFETY: call {{.*}}__hwasan_memmove
++  ; SAFETY-NOT: call {{.*}}__hwasan_generate_tag
++  ; SAFETY-NOT: call {{.*}}__hwasan_memmove
++  ; NOSTACK-NOT: call {{.*}}__hwasan_generate_tag
++  ; NOSTACK-NOT: call {{.*}}__hwasan_memmove
++  %buf.sroa.0 = alloca [10 x i8], align 4
++  %ptr = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %x = bitcast [10 x i8]* %buf.sroa.0 to i8*
++  %buf.sroa.1 = alloca [10 x i8], align 4
++  %ptr1 = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %y = bitcast [10 x i8]* %buf.sroa.1 to i8*
++  call void @llvm.memmove.p0i8.p0i8.i32(i8* %ptr, i8* %ptr1, i32 1, i1 true)
++  ret i32 0
++}
++
+ ; Check an alloca with out of range GEP to ensure it gets a tag and check.
+ define i32 @test_out_of_range(i32* %a) sanitize_hwaddress {
+ entry:
+@@ -97,6 +148,61 @@ entry:
+   ret i32 0
+ }
+ 
++define i32 @test_out_of_range3(i32* %a) sanitize_hwaddress {
++entry:
++  ; CHECK-LABEL: @test_out_of_range3
++  ; NOSAFETY: call {{.*}}__hwasan_generate_tag
++  ; NOSAFETY: call {{.*}}__hwasan_memset
++  ; SAFETY: call {{.*}}__hwasan_generate_tag
++  ; SAFETY: call {{.*}}__hwasan_memset
++  ; NOSTACK-NOT: call {{.*}}__hwasan_generate_tag
++  ; NOSTACK-NOT: call {{.*}}__hwasan_memset
++  %buf.sroa.0 = alloca [10 x i8], align 4
++  %ptr = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %x = bitcast [10 x i8]* %buf.sroa.0 to i8*
++  call void @llvm.memset.p0i8.i32(i8* %ptr, i8 0, i32 2, i1 true)
++  ret i32 0
++}
++
++define i32 @test_out_of_range4(i32* %a) sanitize_hwaddress {
++entry:
++  ; CHECK-LABEL: @test_out_of_range4
++  ; NOSAFETY: call {{.*}}__hwasan_generate_tag
++  ; NOSAFETY: call {{.*}}__hwasan_memmove
++  ; SAFETY: call {{.*}}__hwasan_generate_tag
++  ; SAFETY: call {{.*}}__hwasan_memmove
++  ; NOSTACK-NOT: call {{.*}}__hwasan_generate_tag
++  ; NOSTACK-NOT: call {{.*}}__hwasan_memmove
++  %buf.sroa.0 = alloca [10 x i8], align 4
++  %ptr = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %x = bitcast [10 x i8]* %buf.sroa.0 to i8*
++  call void @llvm.memmove.p0i8.p0i8.i32(i8* %ptr, i8* %ptr, i32 2, i1 true)
++  ret i32 0
++}
++
++define i32 @test_out_of_range5(i32* %a) sanitize_hwaddress {
++entry:
++  ; CHECK-LABEL: @test_out_of_range5
++  ; NOSAFETY: call {{.*}}__hwasan_generate_tag
++  ; NOSAFETY: call {{.*}}__hwasan_memmove
++  ; SAFETY: call {{.*}}__hwasan_generate_tag
++  ; SAFETY: call {{.*}}__hwasan_memmove
++  ; NOSTACK-NOT: call {{.*}}__hwasan_generate_tag
++  ; NOSTACK-NOT: call {{.*}}__hwasan_memmove
++  %buf.sroa.0 = alloca [10 x i8], align 4
++  %ptr = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %x = bitcast [10 x i8]* %buf.sroa.0 to i8*
++  %buf.sroa.1 = alloca [10 x i8], align 4
++  %ptr1 = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %y = bitcast [10 x i8]* %buf.sroa.1 to i8*
++  call void @llvm.lifetime.start.p0i8(i64 10, i8* nonnull %x)
++  call void @llvm.lifetime.end.p0i8(i64 10, i8* nonnull %x)
++  call void @llvm.lifetime.start.p0i8(i64 10, i8* nonnull %y)
++  call void @llvm.memmove.p0i8.p0i8.i32(i8* %ptr, i8* %ptr1, i32 1, i1 true)
++  call void @llvm.lifetime.end.p0i8(i64 10, i8* nonnull %y)
++  ret i32 0
++}
++
+ ; Check an alloca with potentially out of range GEP to ensure it gets a tag and
+ ; check.
+ define i32 @test_potentially_out_of_range(i32* %a) sanitize_hwaddress {
+@@ -117,6 +223,21 @@ entry:
+   ret i32 0
+ }
+ 
++define i32 @test_potentially_out_of_range2(i8* %a) sanitize_hwaddress {
++entry:
++  ; CHECK-LABEL: @test_potentially_out_of_range2
++  ; NOSAFETY: call {{.*}}__hwasan_generate_tag
++  ; NOSAFETY: call {{.*}}__hwasan_memmove
++  ; SAFETY-NOT: call {{.*}}__hwasan_generate_tag
++  ; SAFETY: call {{.*}}__hwasan_memmove
++  ; NOSTACK-NOT: call {{.*}}__hwasan_generate_tag
++  ; NOSTACK: call {{.*}}__hwasan_memmove
++  %buf.sroa.0 = alloca [10 x i8], align 4
++  %ptr = getelementptr [10 x i8], [10 x i8]* %buf.sroa.0, i32 0, i32 9
++  %x = bitcast [10 x i8]* %buf.sroa.0 to i8*
++  call void @llvm.memmove.p0i8.p0i8.i32(i8* %ptr, i8* %a, i32 1, i1 true)
++  ret i32 0
++}
+ ; Check an alloca with potentially out of range GEP to ensure it gets a tag and
+ ; check.
+ define i32 @test_unclear(i32* %a) sanitize_hwaddress {
+@@ -179,6 +300,10 @@ declare void @llvm.lifetime.start.p0i8(i64 immarg, i8* nocapture)
+ ; Function Attrs: argmemonly mustprogress nofree nosync nounwind willreturn
+ declare void @llvm.lifetime.end.p0i8(i64 immarg, i8* nocapture)
+ 
++declare void @llvm.memset.p0i8.i32(i8*, i8, i32, i1)
++declare void @llvm.memcpy.p0i8.p0i8.i32(i8*, i8*, i32, i1)
++declare void @llvm.memmove.p0i8.p0i8.i32(i8*, i8*, i32, i1)
++
+ declare i1 @cond()
+ declare void @use(i8* nocapture)
+ declare i32 @getoffset()
