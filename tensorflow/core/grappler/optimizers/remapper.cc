@@ -329,9 +329,20 @@ template <typename Pattern>
 bool IsCpuCompatible(const RemapperContext& ctx, const Pattern& matched) {
   const NodeDef& node = ctx.graph_view.graph()->node(matched.contraction);
   if (IsConv2D(node)) {
-    return IsCpuCompatibleConv2D(ctx, &node);
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+    // In oneDNN v2.4, Fused Conv2d ended up in gemm Conv, which is quite slow.
+    // Disable contraction until oneDNN provide fast implementation.
+    return false;
+#else
+    IsCpuCompatibleConv2D(ctx, &node);
+#endif
   } else if (IsDepthwiseConv2dNative(node)) {
-    return (IsMKLEnabled() && IsCpuCompatibleDepthwiseConv2dNative(&node));
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+    // Ditto.
+    return false;
+#else
+    (IsMKLEnabled() && IsCpuCompatibleDepthwiseConv2dNative(&node));
+#endif
   } else if (IsMatMul(node)) {
     return IsCpuCompatibleMatMul(ctx, &node);
   } else {
@@ -438,10 +449,16 @@ bool FindContractionWithBias(const RemapperContext& ctx, int node_index,
   const auto* contraction_node_view = regular_fanin_0.node_view();
   const auto* contraction_node_def = contraction_node_view->node();
 
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+  // In oneDNN v2.4, Fused Conv2d ended up in gemm Conv, which is quite slow.
+  // Disable contraction until oneDNN provide fast implementation.
+  bool is_contraction = IsMatMul(*contraction_node_def);
+#else
   // Conv2D, MatMul or DepthwiseConv2D
   bool is_contraction = IsConv2D(*contraction_node_def) ||
                         IsMatMul(*contraction_node_def) ||
                         IsDepthwiseConv2dNative(*contraction_node_def);
+#endif
 
   if (!is_contraction || !HaveSameDataType(node_def, contraction_node_def) ||
       HasControlFaninOrFanout(*contraction_node_view) ||
@@ -554,6 +571,11 @@ bool FindConv2DWithSqueezeAndBias(const RemapperContext& ctx, int node_index,
       !HasAtMostOneFanoutAtPort0(*conv2d_node_view) ||
       IsInPreserveSet(ctx, conv2d_node_def))
     return false;
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+  // In oneDNN v2.4, Fused Conv2d ended up in gemm Conv, which is quite slow.
+  // Disable contraction until oneDNN provide fast implementation.
+  return false;
+#endif
 
   // Check that data type and data format are supported on assigned device.
   const ContractionWithSqueezeAndBiasAdd pattern{
@@ -606,6 +628,11 @@ bool FindConv2DWithBatchNorm(const RemapperContext& ctx, int node_index,
       !HasAtMostOneFanoutAtPort0(*conv2d_node_view) ||
       IsInPreserveSet(ctx, conv2d_node_def))
     return false;
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+  // In oneDNN v2.4, Fused Conv2d ended up in gemm Conv, which is quite slow.
+  // Disable contraction until oneDNN provide fast implementation.
+  return false;
+#endif
 
   // We successfully found a Conv2D+FusedBatchNorm pattern.
   matched->contraction = conv2d_node_view->node_index();
