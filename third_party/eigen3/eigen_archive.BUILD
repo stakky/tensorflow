@@ -48,9 +48,14 @@ cc_library(
         # code. We use it, but we do not rely on it, as evidenced above.
         "EIGEN_MPL2_ONLY",
         "EIGEN_MAX_ALIGN_BYTES=64",
+    #   "EIGEN_USE_BLAS",
+    #   "EIGEN_USE_LAPACK",
     ],
+    #copts = [ "-SSL2BLAMP", ],
+    #linkopts = [ "--linkfortran", ],
     includes = ["."],
     visibility = ["//visibility:public"],
+    #linkopts = ["-lfjlapackexsve",],
 )
 
 filegroup(

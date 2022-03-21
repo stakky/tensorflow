@@ -16,7 +16,13 @@ limitations under the License.
 #if defined(ENABLE_ONEDNN_OPENMP) && defined(ENABLE_MKL) && defined(_OPENMP)
 #ifndef DNNL_AARCH64_USE_ACL
 // Using LLVM's OpenMP header
+#if	defined(FJ_TWEAKS_FOR_AARCH64) && defined(__FCC_version__)
+// On build with Fujitsu compiler, in which llvm_openmp is not used,
+// omp.h provided by the vendor should be used.
+#include "omp.h"
+#else
 #include "external/llvm_openmp/include/omp.h"
+#endif
 /* Added EIGEN_DONT_PARALLELIZE to avoid duplicating omp.h, please refer to
 this link https://eigen.tuxfamily.org/dox/TopicMultiThreading.html for more
 info. It does not have any negative impact on performance. */

@@ -67,14 +67,17 @@ cc_library(
         ],
         exclude = [
             "src/cpu/x64/**",
+            "src/cpu/aarch64/acl_*.cpp",
+            "src/cpu/aarch64/**/acl_*.cpp",
         ],
     ),
     copts = [
         "-fexceptions",
         "-UUSE_MKL",
-        "-UUSE_CBLAS",
+    #   "-UUSE_CBLAS",
     ],
-    defines = ["DNNL_AARCH64_USE_ACL=1"],
+    #defines = ["DNNL_AARCH64_USE_ACL=1"],
+    defines = ["USE_CBLAS"],
     includes = [
         "include",
         "src",
@@ -99,7 +102,7 @@ cc_library(
         ":dnnl_version_h",
     ],
     visibility = ["//visibility:public"],
-    deps = [
-        "@compute_library//:arm_compute",
-    ],
+    #deps = [
+    #    "@compute_library//:arm_compute",
+    #],
 )
