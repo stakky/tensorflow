@@ -20,8 +20,12 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
 #include <vector>
-
+extern "C"{
+  #include "bblas.h"
+}
+#endif
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -611,6 +615,65 @@ struct LaunchBatchMatMul<GPUDevice, Eigen::half> {
 
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
+#if	defined(FJ_TWEAKS_FOR_AARCH64)
+template <typename Ta, typename Tb, typename Tout>
+void BblasGemmBatch(const CBLAS_LAYOUT Layout, const bool TransA,
+                         const bool TransB, const std::vector<int>& M_Array,
+                         const std::vector<int>& N_Array,
+                         const std::vector<int>& K_Array, const Ta** A_Array,
+                         const std::vector<int>& lda_Array,
+                         const Tb** B_Array,
+                         const std::vector<int>& ldb_Array, Tout** C_Array,
+                         const std::vector<int>& ldc_Array,
+                         const int group_count,
+                         const std::vector<int>& group_size) {
+  std::vector<CBLAS_TRANSPOSE> TransA_Array(
+      group_size[0], TransA ? CblasTrans : CblasNoTrans);
+  std::vector<CBLAS_TRANSPOSE> TransB_Array(
+      group_size[0], TransB ? CblasTrans : CblasNoTrans);
+  if (std::is_same<Tout, Ta>::value && std::is_same<Tout, Tb>::value) {
+    if (std::is_same<Tout, float>::value) {
+      std::vector<float> alpha_Array(group_size[0], 1.0);
+      std::vector<float> beta_Array(group_size[0], 0.0);
+      if(group_size[0] == 1) {    // batch_size == 1
+	cblas_sgemm(Layout, TransA_Array[0], TransB_Array[0], M_Array[0],
+		    N_Array[0], K_Array[0], alpha_Array[0], reinterpret_cast<const float**>(A_Array)[0],
+		    lda_Array[0], reinterpret_cast<const float**>(B_Array)[0], ldb_Array[0],
+		    beta_Array[0], reinterpret_cast<float**>(C_Array)[0], ldc_Array[0]);
+      } else {
+	cblas_sgemm_batch(Layout, &TransA_Array[0], &TransB_Array[0], &M_Array[0],
+			  &N_Array[0], &K_Array[0], &alpha_Array[0],
+			  reinterpret_cast<const float**>(A_Array), &lda_Array[0],
+			  reinterpret_cast<const float**>(B_Array), &ldb_Array[0],
+			  &beta_Array[0], reinterpret_cast<float**>(C_Array),
+			  &ldc_Array[0], group_count, &group_size[0]);
+      }
+    } else if (std::is_same<Tout, double>::value) {
+      std::vector<double> alpha_Array(group_size[0], 1.0);
+      std::vector<double> beta_Array(group_size[0], 0.0);
+      if(group_size[0] == 1) {   // batch_size == 1
+	cblas_dgemm(Layout, TransA_Array[0], TransB_Array[0], M_Array[0],
+		    N_Array[0], K_Array[0], alpha_Array[0], reinterpret_cast<const double**>(A_Array)[0],
+		    lda_Array[0], reinterpret_cast<const double**>(B_Array)[0], ldb_Array[0],
+		    beta_Array[0], reinterpret_cast<double**>(C_Array)[0], ldc_Array[0]);
+      } else {
+	cblas_dgemm_batch(
+	    Layout, &TransA_Array[0], &TransB_Array[0], &M_Array[0], &N_Array[0],
+	    &K_Array[0], &alpha_Array[0],
+	    reinterpret_cast<const double**>(A_Array), &lda_Array[0],
+	    reinterpret_cast<const double**>(B_Array), &ldb_Array[0],
+	    &beta_Array[0], reinterpret_cast<double**>(C_Array), &ldc_Array[0],
+	    group_count, &group_size[0]);
+      }
+    } else {
+      // NOTREACHED
+    }
+  } else {
+    // NOTREACHED
+  }
+}
+#endif	// defined(FJ_TWEAKS_FOR_AARCH64)
+
 template <typename Device, typename Ta, typename Tb, typename Tout>
 class BaseBatchMatMulOp : public OpKernel {
  public:
@@ -652,84 +715,159 @@ class BaseBatchMatMulOp : public OpKernel {
 
     TensorShape out_shape = bcast.output_batch_shape();
     auto batch_size = bcast.output_batch_size();
-    auto d0 = in0.dim_size(in0.dims() - 2);
-    auto d1 = in0.dim_size(in0.dims() - 1);
-    Tensor in0_reshaped;
-    OP_REQUIRES(
-        ctx,
-        in0_reshaped.CopyFrom(in0, TensorShape({bcast.x_batch_size(), d0, d1})),
-        errors::Internal("Failed to reshape In[0] from ",
-                         in0.shape().DebugString()));
-    auto d2 = in1.dim_size(in1.dims() - 2);
-    auto d3 = in1.dim_size(in1.dims() - 1);
-    Tensor in1_reshaped;
-    OP_REQUIRES(
-        ctx,
-        in1_reshaped.CopyFrom(in1, TensorShape({bcast.y_batch_size(), d2, d3})),
-        errors::Internal("Failed to reshape In[1] from ",
-                         in1.shape().DebugString()));
-    if (adj_x_ || trans_x_) std::swap(d0, d1);
-    if (adj_y_ || trans_y_) std::swap(d2, d3);
-    OP_REQUIRES(
-        ctx, d1 == d2,
-        errors::InvalidArgument(
-            "Matrix size-incompatible: In[0]: ", in0.shape().DebugString(),
-            ", In[1]: ", in1.shape().DebugString()));
-    out_shape.AddDim(d0);
-    out_shape.AddDim(d3);
-    Tensor* out = nullptr;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
-    if (out->NumElements() == 0) {
-      return;
-    }
-    if (in0.NumElements() == 0 || in1.NumElements() == 0) {
-      functor::SetZeroFunctor<Device, Tout> f;
-      f(ctx->eigen_device<Device>(), out->flat<Tout>());
-      return;
-    }
-    Tensor out_reshaped;
-    OP_REQUIRES(ctx,
-                out_reshaped.CopyFrom(*out, TensorShape({batch_size, d0, d3})),
-                errors::Internal("Failed to reshape output from ",
-                                 out->shape().DebugString()));
-    if (std::is_same<Ta, bfloat16>::value &&
-        std::is_same<Tb, bfloat16>::value) {
-      bool is_cpu = std::is_same<Device, CPUDevice>::value;
-      OP_REQUIRES(ctx, is_cpu,
-                  errors::Internal("bfloat16 matmul is not supported by GPU"));
-      Tensor in0_reshaped_float, in1_reshaped_float, out_reshaped_float;
-      OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_FLOAT, in0_reshaped.shape(),
-                                             &in0_reshaped_float));
-      OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_FLOAT, in1_reshaped.shape(),
-                                             &in1_reshaped_float));
-      OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_FLOAT, out_reshaped.shape(),
-                                             &out_reshaped_float));
 
-      // TODO: Avoid extra copy to make bfloat16 matmul efficient on CPU.
-      BFloat16ToFloat(in0_reshaped.flat<bfloat16>().data(),
-                      in0_reshaped_float.flat<float>().data(),
-                      in0_reshaped.NumElements());
-      BFloat16ToFloat(in1_reshaped.flat<bfloat16>().data(),
-                      in1_reshaped_float.flat<float>().data(),
-                      in1_reshaped.NumElements());
+    if ((std::is_same<Tout, float>::value || std::is_same<Tout, double>::value)
+        && (std::is_same<Tout, Ta>::value && std::is_same<Tout, Tb>::value)) {
+      auto d0 = in0.dim_size(in0.dims() - 2);
+      auto d1 = in0.dim_size(in0.dims() - 1);
+      auto d2 = in1.dim_size(in1.dims() - 2);
+      auto d3 = in1.dim_size(in1.dims() - 1);
 
-      LaunchBatchMatMul<Device, float>::Launch(
-          ctx, in0_reshaped_float, in1_reshaped_float, adj_x_, adj_y_, trans_x_,
-          trans_y_, bcast, &out_reshaped_float);
-      FloatToBFloat16(out_reshaped_float.flat<float>().data(),
-                      out_reshaped.flat<bfloat16>().data(), out->NumElements());
+      if (adj_x_ || trans_x_) std::swap(d0, d1);
+      if (adj_y_ || trans_y_) std::swap(d2, d3);
+      OP_REQUIRES(ctx, d1 == d2,
+                  errors::InvalidArgument(
+                    "in0 mismatch in1 shape: ", d1, " vs. ", d2,
+                    ": ", in0.shape().DebugString(), " ",
+                    in1.shape().DebugString(), " ", adj_x_, " ", adj_y_));
+
+      out_shape.AddDim(d0);
+      out_shape.AddDim(d3);
+
+      Tensor* out = nullptr;
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
+      if (out->NumElements() == 0) {
+        return;
+      }
+      if (in0.NumElements() == 0 || in1.NumElements() == 0) {
+        functor::SetZeroFunctor<Device, Tout> f;
+        f(ctx->eigen_device<Device>(), out->flat<Tout>());
+        return;
+      }
+
+      auto in0_reshaped = in0.template flat_inner_dims<Ta, 3>();
+      auto in1_reshaped = in1.template flat_inner_dims<Tb, 3>();
+      auto out_reshaped = out->template flat_inner_dims<Tout, 3>();
+      const uint64 M = in0_reshaped.dimension(adj_x_ ? 2 : 1);
+      const uint64 K = in0_reshaped.dimension(adj_x_ ? 1 : 2);
+      const uint64 N = in1_reshaped.dimension(adj_y_ ? 1 : 2);
+
+      std::vector<int> m_array(batch_size, M);
+      std::vector<int> n_array(batch_size, N);
+      std::vector<int> k_array(batch_size, K);
+      std::vector<int> lda_array(batch_size, (adj_x_ || trans_x_) ? M : K);
+      std::vector<int> ldb_array(batch_size, (adj_y_ || trans_y_) ? K : N);
+      std::vector<int> ldc_array(batch_size, N);
+      std::vector<int> group_size(1, batch_size);
+      std::vector<const Ta*> a_array;
+      std::vector<const Tb*> b_array;
+      std::vector<Tout*> c_array;
+      a_array.reserve(batch_size);
+      b_array.reserve(batch_size);
+      c_array.reserve(batch_size);
+
+      if (!bcast.IsBroadcastingRequired()) {
+        for (int64 i = 0; i < batch_size; i++) {
+          a_array.push_back(&in0_reshaped(i, 0, 0));
+          b_array.push_back(&in1_reshaped(i, 0, 0));
+          c_array.push_back(&out_reshaped(i, 0, 0));
+        }
+      } else {
+        // Broadcasting is needed, so get the mapping from flattened output batch
+        // indices to x's and y's flattened batch indices.
+        const std::vector<int64>& a_batch_indices = bcast.x_batch_indices();
+        const std::vector<int64>& b_batch_indices = bcast.y_batch_indices();
+
+        for (int64 i = 0; i < batch_size; i++) {
+          a_array.push_back(&in0_reshaped(a_batch_indices[i], 0, 0));
+          b_array.push_back(&in1_reshaped(b_batch_indices[i], 0, 0));
+          c_array.push_back(&out_reshaped(i, 0, 0));
+        }
+      }
+
+      BblasGemmBatch(CblasRowMajor, (adj_x_ || trans_x_), (adj_y_ || trans_y_), m_array, n_array, k_array,
+                         &a_array[0], lda_array, &b_array[0], ldb_array,
+                         &c_array[0], ldc_array, 1, group_size);
     } else {
-      // Cast tensor to desired type to reuse Eigen.
-      // TODO(b/178749687): remove this cast if Eigen supports this natively.
-      if (!std::is_same<Ta, Tout>::value) {
-        in0_reshaped = CastTensor<Ta, Tout>(in0_reshaped);
+      auto d0 = in0.dim_size(in0.dims() - 2);
+      auto d1 = in0.dim_size(in0.dims() - 1);
+      Tensor in0_reshaped;
+      OP_REQUIRES(
+	  ctx,
+	  in0_reshaped.CopyFrom(in0, TensorShape({bcast.x_batch_size(), d0, d1})),
+	  errors::Internal("Failed to reshape In[0] from ",
+			   in0.shape().DebugString()));
+      auto d2 = in1.dim_size(in1.dims() - 2);
+      auto d3 = in1.dim_size(in1.dims() - 1);
+      Tensor in1_reshaped;
+      OP_REQUIRES(
+	  ctx,
+	  in1_reshaped.CopyFrom(in1, TensorShape({bcast.y_batch_size(), d2, d3})),
+	  errors::Internal("Failed to reshape In[1] from ",
+			   in1.shape().DebugString()));
+      if (adj_x_ || trans_x_) std::swap(d0, d1);
+      if (adj_y_ || trans_y_) std::swap(d2, d3);
+      OP_REQUIRES(
+	  ctx, d1 == d2,
+	  errors::InvalidArgument(
+	      "Matrix size-incompatible: In[0]: ", in0.shape().DebugString(),
+	      ", In[1]: ", in1.shape().DebugString()));
+      out_shape.AddDim(d0);
+      out_shape.AddDim(d3);
+      Tensor* out = nullptr;
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
+      if (out->NumElements() == 0) {
+	return;
       }
-      if (!std::is_same<Tb, Tout>::value) {
-        in1_reshaped = CastTensor<Tb, Tout>(in1_reshaped);
+      if (in0.NumElements() == 0 || in1.NumElements() == 0) {
+	functor::SetZeroFunctor<Device, Tout> f;
+	f(ctx->eigen_device<Device>(), out->flat<Tout>());
+	return;
       }
-      LaunchBatchMatMul<Device, Tout>::Launch(ctx, in0_reshaped, in1_reshaped,
-                                              adj_x_, adj_y_, trans_x_,
-                                              trans_y_, bcast, &out_reshaped);
+      Tensor out_reshaped;
+      OP_REQUIRES(ctx,
+		  out_reshaped.CopyFrom(*out, TensorShape({batch_size, d0, d3})),
+		  errors::Internal("Failed to reshape output from ",
+				   out->shape().DebugString()));
+      if (std::is_same<Ta, bfloat16>::value &&
+	  std::is_same<Tb, bfloat16>::value) {
+	bool is_cpu = std::is_same<Device, CPUDevice>::value;
+	OP_REQUIRES(ctx, is_cpu,
+		    errors::Internal("bfloat16 matmul is not supported by GPU"));
+	Tensor in0_reshaped_float, in1_reshaped_float, out_reshaped_float;
+	OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_FLOAT, in0_reshaped.shape(),
+					       &in0_reshaped_float));
+	OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_FLOAT, in1_reshaped.shape(),
+					       &in1_reshaped_float));
+	OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_FLOAT, out_reshaped.shape(),
+					       &out_reshaped_float));
+
+	// TODO: Avoid extra copy to make bfloat16 matmul efficient on CPU.
+	BFloat16ToFloat(in0_reshaped.flat<bfloat16>().data(),
+			in0_reshaped_float.flat<float>().data(),
+			in0_reshaped.NumElements());
+	BFloat16ToFloat(in1_reshaped.flat<bfloat16>().data(),
+			in1_reshaped_float.flat<float>().data(),
+			in1_reshaped.NumElements());
+
+	LaunchBatchMatMul<Device, float>::Launch(
+	    ctx, in0_reshaped_float, in1_reshaped_float, adj_x_, adj_y_, trans_x_,
+	    trans_y_, bcast, &out_reshaped_float);
+	FloatToBFloat16(out_reshaped_float.flat<float>().data(),
+			out_reshaped.flat<bfloat16>().data(), out->NumElements());
+      } else {
+	// Cast tensor to desired type to reuse Eigen.
+	// TODO(b/178749687): remove this cast if Eigen supports this natively.
+	if (!std::is_same<Ta, Tout>::value) {
+	  in0_reshaped = CastTensor<Ta, Tout>(in0_reshaped);
+	}
+	if (!std::is_same<Tb, Tout>::value) {
+	  in1_reshaped = CastTensor<Tb, Tout>(in1_reshaped);
+	}
+	LaunchBatchMatMul<Device, Tout>::Launch(ctx, in0_reshaped, in1_reshaped,
+						adj_x_, adj_y_, trans_x_,
+						trans_y_, bcast, &out_reshaped);
+      }
     }
   }
 

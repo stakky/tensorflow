@@ -3482,6 +3482,7 @@ tf_kernel_library(
     }),
     prefix = "matmul_op",
     deps = MATH_DEPS + [
+	"@bblas",
         ":eigen_contraction_kernel",
         ":fused_eigen_output_kernels",
     ] + select({

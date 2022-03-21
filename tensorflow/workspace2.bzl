@@ -1070,6 +1070,21 @@ def _tf_repositories():
         ],
     )
 
+    native.new_local_repository(
+	name = "bblas",
+	path = "/INSTALL_PATH/batched_blas_src/",
+	build_file_content = """
+package(default_visibility = ["//visibility:public"])
+cc_library(
+    name = "bblas",
+    hdrs = glob(["*.h"]),
+    includes = [".",],
+    defines = ["_CBLAS_",],
+    linkopts = ["-L/INSTALL_PATH/batched_blas_src -lbatched_blas"],
+)
+    """
+    )
+
 def workspace():
     # Check the bazel version before executing any repository rules, in case
     # those rules rely on the version we require here.
