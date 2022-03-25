@@ -1,0 +1,572 @@
+diff --git a/official/r1/resnet/imagenet_main.py b/official/r1/resnet/imagenet_main.py
+index bbff51dc8..d04c0ade0 100644
+--- a/official/r1/resnet/imagenet_main.py
++++ b/official/r1/resnet/imagenet_main.py
+@@ -30,6 +30,11 @@ from official.r1.resnet import resnet_run_loop
+ from official.utils.flags import core as flags_core
+ from official.utils.logs import logger
+ 
++try:
++  import horovod.tensorflow as hvd
++except ImportError:
++  pass
++
+ DEFAULT_IMAGE_SIZE = 224
+ NUM_CHANNELS = 3
+ NUM_CLASSES = 1001
+@@ -40,7 +45,7 @@ NUM_IMAGES = {
+ }
+ 
+ _NUM_TRAIN_FILES = 1024
+-_SHUFFLE_BUFFER = 10000
++_SHUFFLE_BUFFER = 100
+ 
+ DATASET_NAME = 'ImageNet'
+ 
+@@ -51,11 +56,11 @@ def get_filenames(is_training, data_dir):
+   """Return filenames for dataset."""
+   if is_training:
+     return [
+-        os.path.join(data_dir, 'train-%05d-of-01024' % i)
++        os.path.join(data_dir, 'train/train-%05d-of-01024' % i)
+         for i in range(_NUM_TRAIN_FILES)]
+   else:
+     return [
+-        os.path.join(data_dir, 'validation-%05d-of-00128' % i)
++        os.path.join(data_dir, 'val/val-%05d-of-00128' % i)
+         for i in range(128)]
+ 
+ 
+@@ -192,17 +197,17 @@ def input_fn(is_training,
+   filenames = get_filenames(is_training, data_dir)
+   dataset = tf.data.Dataset.from_tensor_slices(filenames)
+ 
+-  if input_context:
++  if input_context and not resnet_run_loop.horovod_is_valid():
+     tf.compat.v1.logging.info(
+         'Sharding the dataset: input_pipeline_id=%d num_input_pipelines=%d' % (
+             input_context.input_pipeline_id, input_context.num_input_pipelines))
+     dataset = dataset.shard(input_context.num_input_pipelines,
+                             input_context.input_pipeline_id)
+-
+-  if is_training:
+-    # Shuffle the input files
+-    dataset = dataset.shuffle(buffer_size=_NUM_TRAIN_FILES)
+-
++  elif resnet_run_loop.horovod_is_valid():
++    tf.compat.v1.logging.info(
++        'Sharding the dataset by horovod: input_pipeline_id=%d num_input_pipelines=%d' % (
++            hvd.rank(), hvd.size()))
++    dataset = dataset.shard(hvd.size(), hvd.rank())
+   # Convert to individual records.
+   # cycle_length = 10 means that up to 10 files will be read and deserialized in
+   # parallel. You may want to increase this number if you have a large number of
+@@ -210,7 +215,8 @@ def input_fn(is_training,
+   dataset = dataset.interleave(
+       tf.data.TFRecordDataset,
+       cycle_length=10,
+-      num_parallel_calls=tf.data.experimental.AUTOTUNE)
++      num_parallel_calls=1
++  )
+ 
+   return resnet_run_loop.process_record_dataset(
+       dataset=dataset,
+@@ -323,8 +329,12 @@ def imagenet_model_fn(features, labels, mode, params):
+     warmup = True
+     base_lr = .128
+ 
++  batch_size = params['batch_size'] * params.get('num_workers', 1)
++  if resnet_run_loop.horovod_is_valid():
++    batch_size = batch_size * hvd.size()
++
+   learning_rate_fn = resnet_run_loop.learning_rate_with_decay(
+-      batch_size=params['batch_size'] * params.get('num_workers', 1),
++      batch_size=batch_size,
+       batch_denom=256, num_images=NUM_IMAGES['train'],
+       boundary_epochs=[30, 60, 80, 90], decay_rates=[1, 0.1, 0.01, 0.001, 1e-4],
+       warmup=warmup, base_lr=base_lr)
+@@ -386,6 +396,7 @@ def main(_):
+ 
+ 
+ if __name__ == '__main__':
++  #tf.compat.v1.get_logger().propagate = False
+   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
+   define_imagenet_flags()
+   absl_app.run(main)
+diff --git a/official/r1/resnet/lars_optimizer.py b/official/r1/resnet/lars_optimizer.py
+new file mode 100644
+index 000000000..ed21e9ea2
+--- /dev/null
++++ b/official/r1/resnet/lars_optimizer.py
+@@ -0,0 +1,180 @@
++# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Layer-wise Adaptive Rate Scaling optimizer for large-batch training."""
++
++from __future__ import absolute_import
++from __future__ import division
++from __future__ import print_function
++
++from tensorflow.python.framework import ops
++from tensorflow.python.ops import array_ops
++from tensorflow.python.ops import linalg_ops
++from tensorflow.python.ops import math_ops
++from tensorflow.python.training import optimizer
++from tensorflow.python.training import training_ops
++from tensorflow.python.util.tf_export import tf_export
++
++
++@tf_export(v1=["train.LARSOptimizer"])
++class LARSOptimizer(optimizer.Optimizer):
++  """Layer-wise Adaptive Rate Scaling for large batch training.
++
++  Introduced by "Large Batch Training of Convolutional Networks" by Y. You,
++  I. Gitman, and B. Ginsburg. (https://arxiv.org/abs/1708.03888)
++
++  Implements the LARS learning rate scheme presented in the paper above. This
++  optimizer is useful when scaling the batch size to up to 32K without
++  significant performance degradation. It is recommended to use the optimizer
++  in conjunction with:
++      - Gradual learning rate warm-up
++      - Linear learning rate scaling
++      - Poly rule learning rate decay
++
++  Note, LARS scaling is currently only enabled for dense tensors. Sparse tensors
++  use the default momentum optimizer.
++  """
++
++  def __init__(
++      self,
++      learning_rate,
++      momentum=0.9,
++      weight_decay=0.0001,
++      # The LARS coefficient is a hyperparameter
++      eeta=0.001,
++      epsilon=0.0,
++      name="LARSOptimizer",
++      # Enable skipping variables from LARS scaling.
++      # TODO(sameerkm): Enable a direct mechanism to pass a
++      # subset of variables to the optimizer.
++      skip_list=None,
++      use_nesterov=False):
++    """Construct a new LARS Optimizer.
++
++    Args:
++      learning_rate: A `Tensor` or floating point value. The base learning rate.
++      momentum: A floating point value. Momentum hyperparameter.
++      weight_decay: A floating point value. Weight decay hyperparameter.
++      eeta: LARS coefficient as used in the paper. Dfault set to LARS
++        coefficient from the paper. (eeta / weight_decay) determines the highest
++        scaling factor in LARS.
++      epsilon: Optional epsilon parameter to be set in models that have very
++        small gradients. Default set to 0.0.
++      name: Optional name prefix for variables and ops created by LARSOptimizer.
++      skip_list: List of strings to enable skipping variables from LARS scaling.
++        If any of the strings in skip_list is a subset of var.name, variable
++        'var' is skipped from LARS scaling. For a typical classification model
++        with batch normalization, the skip_list is ['batch_normalization',
++        'bias']
++      use_nesterov: when set to True, nesterov momentum will be enabled
++
++    Raises:
++      ValueError: If a hyperparameter is set to a non-sensical value.
++    """
++    if momentum < 0.0:
++      raise ValueError("momentum should be positive: %s" % momentum)
++    if weight_decay < 0.0:
++      raise ValueError("weight_decay should be positive: %s" % weight_decay)
++    super(LARSOptimizer, self).__init__(use_locking=False, name=name)
++
++    self._learning_rate = learning_rate
++    self._momentum = momentum
++    self._weight_decay = weight_decay
++    self._eeta = eeta
++    self._epsilon = epsilon
++    self._name = name
++    self._skip_list = skip_list
++    self._use_nesterov = use_nesterov
++
++  def _create_slots(self, var_list):
++    for v in var_list:
++      self._zeros_slot(v, "momentum", self._name)
++
++  def compute_lr(self, grad, var):
++    scaled_lr = self._learning_rate
++    if self._skip_list is None or not any(v in var.name
++                                          for v in self._skip_list):
++      w_norm = linalg_ops.norm(var, ord=2)
++      g_norm = linalg_ops.norm(grad, ord=2)
++      trust_ratio = array_ops.where(
++          math_ops.greater(w_norm, 0),
++          array_ops.where(
++              math_ops.greater(g_norm, 0),
++              (self._eeta * w_norm /
++               (g_norm + self._weight_decay * w_norm + self._epsilon)), 1.0),
++          1.0)
++      scaled_lr = self._learning_rate * trust_ratio
++      # Add the weight regularization gradient
++      grad = grad + self._weight_decay * var
++    return scaled_lr, grad
++
++  def _apply_dense(self, grad, var):
++    scaled_lr, grad = self.compute_lr(grad, var)
++    mom = self.get_slot(var, "momentum")
++    return training_ops.apply_momentum(
++        var,
++        mom,
++        math_ops.cast(1.0, var.dtype.base_dtype),
++        grad * scaled_lr,
++        self._momentum,
++        use_locking=False,
++        use_nesterov=self._use_nesterov)
++
++  def _resource_apply_dense(self, grad, var):
++    scaled_lr, grad = self.compute_lr(grad, var)
++    mom = self.get_slot(var, "momentum")
++    return training_ops.resource_apply_momentum(
++        var.handle,
++        mom.handle,
++        math_ops.cast(1.0, var.dtype.base_dtype),
++        grad * scaled_lr,
++        self._momentum,
++        use_locking=False,
++        use_nesterov=self._use_nesterov)
++
++  # Fallback to momentum optimizer for sparse tensors
++  def _apply_sparse(self, grad, var):
++    mom = self.get_slot(var, "momentum")
++    return training_ops.sparse_apply_momentum(
++        var,
++        mom,
++        math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
++        grad.values,
++        grad.indices,
++        math_ops.cast(self._momentum_tensor, var.dtype.base_dtype),
++        use_locking=self._use_locking,
++        use_nesterov=self._use_nesterov).op
++
++  def _resource_apply_sparse(self, grad, var, indices):
++    mom = self.get_slot(var, "momentum")
++    return training_ops.resource_sparse_apply_momentum(
++        var.handle,
++        mom.handle,
++        math_ops.cast(self._learning_rate_tensor, grad.dtype),
++        grad,
++        indices,
++        math_ops.cast(self._momentum_tensor, grad.dtype),
++        use_locking=self._use_locking,
++        use_nesterov=self._use_nesterov)
++
++  def _prepare(self):
++    learning_rate = self._learning_rate
++    if callable(learning_rate):
++      learning_rate = learning_rate()
++    self._learning_rate_tensor = ops.convert_to_tensor(
++        learning_rate, name="learning_rate")
++    momentum = self._momentum
++    if callable(momentum):
++      momentum = momentum()
++    self._momentum_tensor = ops.convert_to_tensor(momentum, name="momentum")
+diff --git a/official/r1/resnet/resnet_run_loop.py b/official/r1/resnet/resnet_run_loop.py
+index 72d0e6cd0..1afa85579 100644
+--- a/official/r1/resnet/resnet_run_loop.py
++++ b/official/r1/resnet/resnet_run_loop.py
+@@ -33,6 +33,7 @@ import tensorflow as tf
+ 
+ from official.r1.resnet import imagenet_preprocessing
+ from official.r1.resnet import resnet_model
++from official.r1.resnet import imagenet_main
+ from official.r1.utils import export
+ from official.utils.flags import core as flags_core
+ from official.utils.logs import hooks_helper
+@@ -40,6 +41,20 @@ from official.utils.logs import logger
+ from official.utils.misc import distribution_utils
+ from official.utils.misc import model_helpers
+ 
++hvd_valid = False
++try:
++  import horovod.tensorflow as hvd
++  hvd_valid = True
++
++except ImportError:
++  pass
++
++#
++# Functions for horovod
++#
++def horovod_is_valid():
++  return hvd_valid and flags.FLAGS.horovod
++
+ 
+ ################################################################################
+ # Functions for input processing.
+@@ -82,15 +97,12 @@ def process_record_dataset(dataset,
+     options = tf.data.Options()
+     options.experimental_threading.private_threadpool_size = (
+         datasets_num_private_threads)
++    options.experimental_threading.max_intra_op_parallelism = (
++        datasets_num_private_threads)
+     dataset = dataset.with_options(options)
+     tf.compat.v1.logging.info('datasets_num_private_threads: %s',
+                               datasets_num_private_threads)
+ 
+-  # Disable intra-op parallelism to optimize for throughput instead of latency.
+-  options = tf.data.Options()
+-  options.experimental_threading.max_intra_op_parallelism = 1
+-  dataset = dataset.with_options(options)
+-
+   # Prefetches a batch at a time to smooth out the time taken to load input
+   # files for shuffling and processing.
+   dataset = dataset.prefetch(buffer_size=batch_size)
+@@ -293,13 +305,13 @@ def learning_rate_with_decay(
+     """
+ 
+     # Learning rate schedule for LARS polynomial schedule
+-    if flags.FLAGS.batch_size < 8192:
++    if batch_size < 8192:
+       plr = 5.0
+       w_epochs = 5
+-    elif flags.FLAGS.batch_size < 16384:
++    elif batch_size < 16384:
+       plr = 10.0
+       w_epochs = 5
+-    elif flags.FLAGS.batch_size < 32768:
++    elif batch_size < 32768:
+       plr = 25.0
+       w_epochs = 5
+     else:
+@@ -316,7 +328,7 @@ def learning_rate_with_decay(
+ 
+     min_step = tf.constant(1, dtype=tf.int64)
+     decay_steps = tf.maximum(min_step, tf.subtract(global_step, w_steps))
+-    poly_rate = tf.train.polynomial_decay(
++    poly_rate = tf.compat.v1.train.polynomial_decay(
+         plr,
+         decay_steps,
+         train_steps - w_steps + 1,
+@@ -406,8 +418,8 @@ def resnet_model_fn(features, labels, mode, model_class,
+ 
+   # Calculate loss, which includes softmax cross entropy and L2 regularization.
+   if label_smoothing != 0.0:
+-    one_hot_labels = tf.one_hot(labels, 1001)
+-    cross_entropy = tf.losses.softmax_cross_entropy(
++    one_hot_labels = tf.one_hot(labels, imagenet_main.NUM_CLASSES)
++    cross_entropy = tf.compat.v1.losses.softmax_cross_entropy(
+         logits=logits, onehot_labels=one_hot_labels,
+         label_smoothing=label_smoothing)
+   else:
+@@ -445,7 +457,7 @@ def resnet_model_fn(features, labels, mode, model_class,
+     tf.compat.v1.summary.scalar('learning_rate', learning_rate)
+ 
+     if flags.FLAGS.enable_lars:
+-      optimizer = tf.contrib.opt.LARSOptimizer(
++      optimizer = tf.compat.v1.train.LARSOptimizer(
+           learning_rate,
+           momentum=momentum,
+           weight_decay=weight_decay,
+@@ -462,6 +474,10 @@ def resnet_model_fn(features, labels, mode, model_class,
+           tf.compat.v1.train.experimental.enable_mixed_precision_graph_rewrite(
+               optimizer, loss_scale=loss_scale))
+ 
++    # Horovod: add Horovod Distributed Optimizer.
++    if horovod_is_valid():
++      optimizer = hvd.DistributedOptimizer(optimizer)
++
+     def _dense_grad_filter(gvs):
+       """Only apply gradient updates to the final layer.
+ 
+@@ -542,7 +558,11 @@ def resnet_main(
+     `train_hooks` is a list the instances of hooks used during training.
+   """
+ 
+-  model_helpers.apply_clean(flags.FLAGS)
++  # Horovod: initialize Horovod.
++  if horovod_is_valid():
++    hvd.init()
++    if hvd.rank() != 0:
++      tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+ 
+   # Ensures flag override logic is only executed if explicitly triggered.
+   if flags_obj.tf_gpu_thread_mode:
+@@ -569,6 +589,7 @@ def resnet_main(
+   # Creates a `RunConfig` that checkpoints every 24 hours which essentially
+   # results in checkpoints determined only by `epochs_between_evals`.
+   run_config = tf.estimator.RunConfig(
++      log_step_count_steps=flags_obj.print_every,
+       train_distribute=distribution_strategy,
+       session_config=session_config,
+       save_checkpoints_secs=60*60*24,
+@@ -582,8 +603,28 @@ def resnet_main(
+   else:
+     warm_start_settings = None
+ 
++  # Horovod: save checkpoints only on worker 0 to prevent other workers from
++  # corrupting them.
++  if horovod_is_valid():
++    model_dir = flags_obj.model_dir + "/rank{:03d}".format(hvd.rank())
++    '''
++    if hvd.rank() == 0:
++      model_dir = flags_obj.model_dir
++      tf.compat.v1.logging.info("horovod-dev model_dir = flags_obj.model_dir")
++    else:
++      # eval should use same checkpoint regardless of hvd.rank() ?
++      if flags_obj.eval_only:
++        model_dir = flags_obj.model_dir + str(hvd.rank())
++        tf.compat.v1.logging.info("horovod-dev model dir = %s" % model_dir)
++      else:
++        model_dir = None
++        tf.compat.v1.logging.info("horovod-dev model_dir = None")
++    '''
++  else:
++    model_dir = flags_obj.model_dir
++
+   classifier = tf.estimator.Estimator(
+-      model_fn=model_function, model_dir=flags_obj.model_dir, config=run_config,
++      model_fn=model_function, model_dir=model_dir, config=run_config,
+       warm_start_from=warm_start_settings, params={
+           'resnet_size': int(flags_obj.resnet_size),
+           'data_format': flags_obj.data_format,
+@@ -614,26 +655,40 @@ def resnet_main(
+ 
+   train_hooks = hooks_helper.get_train_hooks(
+       flags_obj.hooks,
+-      model_dir=flags_obj.model_dir,
++      model_dir=model_dir,
+       batch_size=flags_obj.batch_size)
+ 
+   def input_fn_train(num_epochs, input_context=None):
++    batch_size=distribution_utils.per_replica_batch_size(
++      flags_obj.batch_size, flags_core.get_num_gpus(flags_obj))
++
++    # Horovod: BroadcastGlobalVariablesHook broadcasts initial variable states
++    # from rank 0 to all other processes. This is necessary to ensure consistent
++    # initialization of all workers when training is started with random weights
++    # or restored from a checkpoint.
++    if horovod_is_valid():
++      train_hooks.append(hvd.BroadcastGlobalVariablesHook(0))
++      #batch_size = batch_size // hvd.size()
++
+     return input_function(
+         is_training=True,
+         data_dir=flags_obj.data_dir,
+-        batch_size=distribution_utils.per_replica_batch_size(
+-            flags_obj.batch_size, flags_core.get_num_gpus(flags_obj)),
++        batch_size=batch_size,
+         num_epochs=num_epochs,
+         dtype=flags_core.get_tf_dtype(flags_obj),
+         datasets_num_private_threads=flags_obj.datasets_num_private_threads,
+         input_context=input_context)
+ 
+   def input_fn_eval():
++    eval_batch_size = distribution_utils.per_replica_batch_size(
++      flags_obj.batch_size, flags_core.get_num_gpus(flags_obj))
++    if horovod_is_valid():
++      pass #eval_batch_size = eval_batch_size // hvd.size()
++
+     return input_function(
+         is_training=False,
+         data_dir=flags_obj.data_dir,
+-        batch_size=distribution_utils.per_replica_batch_size(
+-            flags_obj.batch_size, flags_core.get_num_gpus(flags_obj)),
++        batch_size=eval_batch_size,
+         num_epochs=1,
+         dtype=flags_core.get_tf_dtype(flags_obj))
+ 
+@@ -692,7 +747,20 @@ def resnet_main(
+       # to terminate.  Note that eval will run for max_train_steps each loop,
+       # regardless of the global_step count.
+       tf.compat.v1.logging.info('Starting to evaluate.')
++
++      from tensorflow.python.training.session_run_hook import SessionRunHook
++      import time
++      class TimeHook(SessionRunHook):
++        def begin(self):
++          self.start = 0
++          self.step_ = 0
++        def before_run(self, run_context): self.start = time.time()
++        def after_run(self, run_context, run_values):
++            self.step_ = self.step_ + 1
++            tf.compat.v1.logging.info('step = %d time = %.3f [sec]', self.step_, (time.time()-self.start))
++
+       eval_results = classifier.evaluate(input_fn=input_fn_eval,
++                                         hooks=[TimeHook()],
+                                          steps=flags_obj.max_train_steps)
+ 
+       benchmark_logger.log_evaluation_result(eval_results)
+diff --git a/official/utils/flags/_base.py b/official/utils/flags/_base.py
+index 176f10bbc..e52b48d61 100644
+--- a/official/utils/flags/_base.py
++++ b/official/utils/flags/_base.py
+@@ -26,9 +26,9 @@ from official.utils.logs import hooks_helper
+ 
+ 
+ def define_base(data_dir=True, model_dir=True, clean=False, train_epochs=False,
+-                epochs_between_evals=False, stop_threshold=False,
++                epochs_between_evals=False, stop_threshold=False, print_every=True,
+                 batch_size=True, num_gpu=False, hooks=False, export_dir=False,
+-                distribution_strategy=False, run_eagerly=False):
++                distribution_strategy=False, run_eagerly=False, horovod=True):
+   """Register base flags.
+ 
+   Args:
+@@ -149,9 +149,22 @@ def define_base(data_dir=True, model_dir=True, clean=False, train_epochs=False,
+                        "according to the number of GPUs.")
+     )
+ 
++  #horovod
++  if horovod:
++    flags.DEFINE_boolean(
++        name="horovod", default=False, short_name="hvd",
++        help=help_wrap("If set, horovod on"))
++    key_flags.append("horovod")
+ 
+-  return key_flags
++  # print log
++  if print_every:
++    flags.DEFINE_integer(
++        name="print_every",
++        default=2**31-1,
++        help=help_wrap("Print every N steps."))
++    key_flags.append("print_every")
+ 
++  return key_flags
+ 
+ def get_num_gpus(flags_obj):
+   """Treat num_gpus=-1 as 'use all'."""
+diff --git a/official/utils/misc/model_helpers.py b/official/utils/misc/model_helpers.py
+index c112bacd4..5333ef8f7 100644
+--- a/official/utils/misc/model_helpers.py
++++ b/official/utils/misc/model_helpers.py
+@@ -86,8 +86,16 @@ def generate_synthetic_data(
+   return tf.data.Dataset.from_tensors(element).repeat()
+ 
+ 
+-def apply_clean(flags_obj):
+-  if flags_obj.clean and tf.io.gfile.exists(flags_obj.model_dir):
++def apply_clean(flags_obj, hvdrank=None):
++  if flags_obj.model_dir is None:
++    return
++
++  if hvdrank is None:
++    model_dir = flags_obj.model_dir
++  else:
++    model_dir = flags_obj.model_dir + str(hvdrank)
++
++  if flags_obj.clean and tf.io.gfile.exists(model_dir):
+     tf.compat.v1.logging.info("--clean flag set. Removing existing model dir:"
+-                              " {}".format(flags_obj.model_dir))
+-    tf.io.gfile.rmtree(flags_obj.model_dir)
++                              " {}".format(model_dir))
++    tf.io.gfile.rmtree(model_dir)

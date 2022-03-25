@@ -1,0 +1,43 @@
+data:
+  train_features_file: dataset/train.en
+  train_labels_file: dataset/train.de
+  eval_features_file: dataset/valid.en
+  eval_labels_file: dataset/valid.de
+  source_vocabulary: dataset/wmtende.vocab
+  target_vocabulary: dataset/wmtende.vocab
+eval:
+  batch_size: 32
+  steps: 10000
+infer:
+  batch_size: 32
+  length_bucket_width: 5
+model_dir: testrun/
+params:
+  average_loss_in_time: true
+  beam_width: 4
+  decay_params:
+    model_dim: 512
+    warmup_steps: 8000
+  decay_type: NoamDecay
+  label_smoothing: 0.1
+  learning_rate: 2.0
+  num_hypotheses: 1
+  optimizer: Adam
+  optimizer_params:
+    beta_1: 0.9
+    beta_2: 0.998
+  dropout: 0.1
+score:
+  batch_size: 64
+train:
+  average_last_checkpoints: 8
+  batch_size: 5120
+  batch_type: tokens
+  effective_batch_size: 5120
+  keep_checkpoint_max: 8
+  length_bucket_width: 1
+  max_step: 20
+  maximum_features_length: 100
+  maximum_labels_length: 100
+  sample_buffer_size: -1
+  save_summary_steps: 1
