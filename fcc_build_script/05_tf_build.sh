@@ -138,7 +138,9 @@ CONFIG_CPP="--cxxopt=-D_GLIBCXX_USE_CXX11_ABI=0"	# needed ?
 
 if [ "$fjenv_use_fcc" != "true" ]; then
     # Less parallelism for GCC, which uses much more memory than fcc or llvm.
-    CONFIG_BAZEL="$CONFIG_BAZEL --jobs=20"
+    [ $MAX_JOBS -gt 20 ] && CONFIG_BAZEL="$CONFIG_BAZEL --jobs=20"
+else
+    [ $MAX_JOBS -gt 30 ] && CONFIG_BAZEL="$CONFIG_BAZEL --jobs=30"
 fi
 #CONFIG_BAZEL="$CONFIG_BAZEL --color=yes --curses=yes"
 #CONFIG_BAZEL="$CONFIG_BAZEL --subcommands=pretty_print"
