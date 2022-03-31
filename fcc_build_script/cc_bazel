@@ -1,0 +1,2 @@
+#! /bin/bash
+exec fcc -Nclang -Knolargepage -Kopenmp ${@#-fstack-protector}
