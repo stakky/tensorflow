@@ -67,8 +67,10 @@ if [ ! -d $DOWNLOAD_PATH/io_bazel_rules_docker ]; then
     # which requires the system being online.
     # Here is a tricky workaround to make offline build possible.
     # Note: Option (shallow-since) and commit hash are taken from the output of online build with using verbose option,
-    #       and the contents of the marker file is obtained by peeking the cache (it resides under $OUTBASE/external).
-    git clone https://github.com/bazelbuild/rules_docker.git --shallow-since "1596824487 -0400" io_bazel_rules_docker
+    #       and the contents of the marker file is obtained from the cahce file (under $OUTBASE/external).
+    # Note2: The second 'git clone' is for one that doesn't support 'shallow-since' (typically git version 1).
+    git clone https://github.com/bazelbuild/rules_docker.git --shallow-since "1596824487 -0400" io_bazel_rules_docker || \
+        git clone https://github.com/bazelbuild/rules_docker.git io_bazel_rules_docker
     (cd io_bazel_rules_docker; git checkout 9bfcd7dbf0294ed9d11a99da6363fc28df904502)
     cat <<EOF>'@io_bazel_rules_docker.marker'
 46fc418cc25637e9fe8b7b25416330d0f38dcfae25a00613666fa63af6a15d30
